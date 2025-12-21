@@ -5,19 +5,19 @@ import re
 import io
 import copy
 import difflib
+import concurrent.futures
 
 # --- CONFIGURATION ---
 
-# 1. URL Sources
 M3U_URL = "https://gist.githubusercontent.com/CiroHoodLove/ba36db853c30c47a3480020e87a352e6/raw/5e6e350293ec1c9ac7fa25fe1c0c6e5b3c3fabab/playlist.m3u"
 
+# Removed US as requested
 EPG_URLS = [
     "https://iptv-epg.org/files/epg-fr.xml.gz",
     "https://iptv-epg.org/files/epg-de.xml.gz",
     "https://iptv-epg.org/files/epg-uk.xml.gz",
     "https://iptv-epg.org/files/epg-es.xml.gz",
     "https://iptv-epg.org/files/epg-it.xml.gz",
-    "https://iptv-epg.org/files/epg-us.xml.gz",
     "https://iptv-epg.org/files/epg-ca.xml.gz",
     "https://iptv-epg.org/files/epg-sa.xml.gz"
 ]
@@ -25,242 +25,262 @@ EPG_URLS = [
 OUTPUT_FILENAME = "custom_epg.xml"
 MISSING_REPORT_FILENAME = "missing_report.txt"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+FUZZY_MATCH_CUTOFF = 0.85
 
-# 2. Fuzzy Match Settings
-FUZZY_MATCH_CUTOFF = 0.85  # 0.0 to 1.0 (0.85 = 85% similarity required)
-
-# 3. MANUAL OVERRIDES
-# Key: The normalized (smashed) name from your M3U.
-# Value: The EXACT 'id' from the EPG XML source.
 MANUAL_OVERRIDES = {
-    # Example: "canalsport" : "CanalPlusSport.fr",
-    # "beinsports1": "BeinSports1.fr" 
+    # "smashed_name": "ExactEPGID"
 }
 
-# --- NORMALIZATION LOGIC ---
+# --- PRE-COMPILED REGEX FOR SPEED ---
+# Compiling regex once increases performance significantly inside loops
+PREFIX_PATTERN = re.compile(r"^(FR:|UK \||DE -|ES:|IT:|US:|CA:|SA:|FR\s|UK\s|DE\s)", re.IGNORECASE)
+SUFFIX_PATTERN = re.compile(r"\b(FHD|HD|SD|H265|VIP|4K|Backup|HEVC|AVC)\b", re.IGNORECASE)
+NON_ALNUM_PATTERN = re.compile(r"[^a-zA-Z0-9]")
+
+# --- HELPER FUNCTIONS ---
+
 def normalize_name(name):
-    """
-    Strips prefixes, suffixes, removes non-alphanumeric characters,
-    and converts to lowercase to create a 'match key'.
-    """
-    if not name:
-        return ""
-    
-    # Specific strings to remove (Case Insensitive)
-    remove_list = [
-        # Prefixes
-        r"^FR:", r"^UK \|", r"^DE -", r"^ES:", r"^IT:", r"^US:", r"^CA:", r"^SA:", 
-        r"^FR\s", r"^UK\s", r"^DE\s",
-        # Suffixes
-        r"\bFHD\b", r"\bHD\b", r"\bSD\b", r"\bH265\b", r"\bVIP\b", r"\b4K\b", r"\bBackup\b",
-        r"\bHEVC\b", r"\bAVC\b"
-    ]
-    
-    clean_name = name
-    for pattern in remove_list:
-        clean_name = re.sub(pattern, "", clean_name, flags=re.IGNORECASE)
+    if not name: return ""
+    # Use compiled patterns
+    clean = PREFIX_PATTERN.sub("", name)
+    clean = SUFFIX_PATTERN.sub("", clean)
+    clean = NON_ALNUM_PATTERN.sub("", clean)
+    return clean.lower()
 
-    # Remove all non-alphanumeric characters (keep only A-Z, 0-9)
-    clean_name = re.sub(r"[^a-zA-Z0-9]", "", clean_name)
-    
-    return clean_name.lower()
-
-# --- NETWORK HELPERS ---
 def download_url(url):
-    print(f"Downloading: {url}")
+    """Downloads a URL and returns the bytes. Errors return None."""
+    # print(f"Start DL: {url.split('/')[-1]}") 
     req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
     try:
-        with urllib.request.urlopen(req) as response:
+        with urllib.request.urlopen(req, timeout=30) as response:
             return response.read()
     except Exception as e:
         print(f"Error downloading {url}: {e}")
         return None
 
-# --- MAIN PROCESS ---
+def process_single_epg(url_data, unmatched_keys, m3u_map, outfile):
+    """
+    Processes one EPG binary blob.
+    1. Decompresses in memory.
+    2. Parses Channels to find matches (Exact -> Manual -> Fuzzy).
+    3. Writes matched Channels to file immediately.
+    4. Parses Programmes and writes matches immediately.
+    Returns: A list of keys that were found (to update the global unmatched list).
+    """
+    url, gz_data = url_data
+    if not gz_data:
+        return []
+
+    found_keys_in_this_file = []
+    
+    try:
+        # Decompress into a seekable memory stream
+        with gzip.GzipFile(fileobj=io.BytesIO(gz_data)) as f:
+            # We read the whole XML into memory for seeking (channel pass + programme pass)
+            # This is faster than re-downloading or re-unzipping
+            xml_bytes = f.read()
+
+        # Wrap in BytesIO for the parser
+        context = io.BytesIO(xml_bytes)
+
+        # --- PASS 1: SCAN CHANNELS & BUILD MAPS ---
+        # We need to map EPG_ID -> [Target_M3U_IDs] for this file
+        source_to_dest_map = {} # { 'epg_id': ['100', '101'] }
+        
+        # We store channel elements temporarily to perform fuzzy matching logic
+        # structure: { 'norm_name': {'id': '...', 'elem': Element} }
+        temp_channel_storage = {}
+        
+        # Iterparse is faster and uses less memory than tree parsing
+        for event, elem in ET.iterparse(context, events=("end",)):
+            if elem.tag == "channel":
+                c_id = elem.get("id")
+                display_name = elem.find("display-name")
+                if display_name is not None and display_name.text:
+                    n_name = normalize_name(display_name.text)
+                    temp_channel_storage[n_name] = {'id': c_id, 'elem': elem}
+                
+                # Clear from memory to keep things fast, we stored what we needed
+                # But we don't clear fully because we need the element structure later
+                # actually, for small channel headers, keeping them in temp_channel_storage is fine.
+                pass 
+        
+        # --- MATCHING LOGIC ---
+        # Now we compare our M3U list against the channels found in this EPG
+        
+        epg_norm_names = list(temp_channel_storage.keys())
+        
+        for m3u_key in list(unmatched_keys):
+            match_found = False
+            source_epg_id = None
+            
+            # 1. Manual Override
+            if m3u_key in MANUAL_OVERRIDES:
+                # We have to find if this override ID exists in this specific file
+                # This is tricky because we indexed by name, not ID. 
+                # Let's do a quick lookup on values
+                tgt_id = MANUAL_OVERRIDES[m3u_key]
+                for k, v in temp_channel_storage.items():
+                    if v['id'] == tgt_id:
+                        source_epg_id = tgt_id
+                        match_found = True
+                        break
+
+            # 2. Exact Match
+            if not match_found:
+                if m3u_key in temp_channel_storage:
+                    source_epg_id = temp_channel_storage[m3u_key]['id']
+                    match_found = True
+
+            # 3. Fuzzy Match
+            if not match_found:
+                matches = difflib.get_close_matches(m3u_key, epg_norm_names, n=1, cutoff=FUZZY_MATCH_CUTOFF)
+                if matches:
+                    best_match = matches[0]
+                    source_epg_id = temp_channel_storage[best_match]['id']
+                    match_found = True
+
+            # 4. If Matched, Prepare for Writing
+            if match_found:
+                # Retrieve the element
+                # We need to find the element again. 
+                # Optimization: We already have the element in temp_channel_storage if matched via name
+                # If matched via Override (ID), we need the element.
+                
+                matched_elem = None
+                
+                # Find the element object
+                for k, v in temp_channel_storage.items():
+                    if v['id'] == source_epg_id:
+                        matched_elem = v['elem']
+                        break
+                
+                if matched_elem is not None:
+                    target_ids = m3u_map[m3u_key]['ids']
+                    source_to_dest_map[source_epg_id] = target_ids
+                    
+                    # WRITE CHANNELS IMMEDIATELY
+                    for tid in target_ids:
+                        # Modify ID
+                        matched_elem.set("id", tid)
+                        # Write string
+                        xml_str = ET.tostring(matched_elem, encoding='utf-8').decode('utf-8')
+                        outfile.write(xml_str + "\n")
+                    
+                    found_keys_in_this_file.append(m3u_key)
+
+        # Free memory of channel storage
+        del temp_channel_storage
+        del epg_norm_names
+
+        # --- PASS 2: PROCESS PROGRAMMES ---
+        # Only if we found matches in this file
+        if source_to_dest_map:
+            context.seek(0) # Go back to start of XML
+            # Use iterparse to stream programmes (very memory efficient)
+            for event, elem in ET.iterparse(context, events=("end",)):
+                if elem.tag == "programme":
+                    src_channel = elem.get("channel")
+                    
+                    if src_channel in source_to_dest_map:
+                        target_ids = source_to_dest_map[src_channel]
+                        
+                        # Write duplicates for every target ID
+                        for tid in target_ids:
+                            elem.set("channel", tid)
+                            xml_str = ET.tostring(elem, encoding='utf-8').decode('utf-8')
+                            outfile.write(xml_str + "\n")
+                    
+                    # CRITICAL: Clear element from memory after processing
+                    elem.clear()
+
+        print(f"  Processed {url.split('/')[-1]} - Matched: {len(found_keys_in_this_file)}")
+        return found_keys_in_this_file
+
+    except Exception as e:
+        print(f"Error processing {url}: {e}")
+        return []
+
+# --- MAIN ---
+
 def main():
-    # 1. Parse M3U Playlist
-    # m3u_map structure: 
-    # { 
-    #   'normalized_name': {
-    #       'ids': ['100', '101'], 
-    #       'original_names': ['FR: Channel FHD', 'FR: Channel HD']
-    #   } 
-    # }
+    print("--- STARTING OPTIMIZED EPG GENERATOR ---")
+    
+    # 1. Download M3U
     m3u_content = download_url(M3U_URL)
-    if not m3u_content:
-        print("Failed to download M3U. Exiting.")
-        return
+    if not m3u_content: return
 
     m3u_text = m3u_content.decode('utf-8', errors='ignore')
     m3u_map = {}
     
     print("Parsing M3U...")
-    lines = m3u_text.splitlines()
-    for line in lines:
-        line = line.strip()
+    # Optimized M3U Parsing
+    for line in m3u_text.splitlines():
         if line.startswith("#EXTINF"):
-            tvg_id_match = re.search(r'tvg-id="([^"]+)"', line)
-            channel_name = line.split(',')[-1].strip()
-            
-            if tvg_id_match and channel_name:
-                tvg_id = tvg_id_match.group(1)
-                norm_name = normalize_name(channel_name)
+            if 'tvg-id="' in line:
+                tvg_id = line.split('tvg-id="')[1].split('"')[0]
+                # Fast string split to get name (last part after comma)
+                channel_name = line.rsplit(',', 1)[-1].strip()
                 
-                if norm_name:
-                    if norm_name not in m3u_map:
-                        m3u_map[norm_name] = {'ids': [], 'original_names': []}
-                    
-                    if tvg_id not in m3u_map[norm_name]['ids']:
-                        m3u_map[norm_name]['ids'].append(tvg_id)
-                    
-                    m3u_map[norm_name]['original_names'].append(channel_name)
+                norm = normalize_name(channel_name)
+                if norm:
+                    if norm not in m3u_map:
+                        m3u_map[norm] = {'ids': [], 'original_names': []}
+                    if tvg_id not in m3u_map[norm]['ids']:
+                        m3u_map[norm]['ids'].append(tvg_id)
+                    m3u_map[norm]['original_names'].append(channel_name)
 
-    # Track which normalized names are still waiting for an EPG
     unmatched_keys = set(m3u_map.keys())
-    total_m3u_channels = len(unmatched_keys)
-    print(f"Found {total_m3u_channels} unique channel groups in M3U.")
+    total_groups = len(unmatched_keys)
+    print(f"M3U Parsed: {total_groups} unique channel groups.")
 
-    # 2. Initialize Output XML
-    output_root = ET.Element("tv")
-    output_root.set("generator-info-name", "Custom EPG Generator")
-    output_root.set("generator-info-url", "https://github.com/CiroHoodLove")
+    # 2. Parallel Download of EPGs
+    print("Downloading EPGs in parallel...")
+    downloaded_epgs = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        # Submit all download tasks
+        future_to_url = {executor.submit(download_url, url): url for url in EPG_URLS}
+        
+        for future in concurrent.futures.as_completed(future_to_url):
+            url = future_to_url[future]
+            try:
+                data = future.result()
+                if data:
+                    downloaded_epgs.append((url, data))
+            except Exception as exc:
+                print(f'{url} generated an exception: {exc}')
 
-    # 3. Process EPGs
-    processed_channels_count = 0
-    
-    for url in EPG_URLS:
-        if not unmatched_keys:
-            print("All channels matched! Skipping remaining EPGs.")
-            break
+    # 3. Open Output File & Write Header
+    with open(OUTPUT_FILENAME, "w", encoding="utf-8") as outfile:
+        outfile.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+        outfile.write('<tv generator-info-name="Custom EPG" generator-info-url="github.com">\n')
 
-        gz_data = download_url(url)
-        if not gz_data:
-            continue
-            
-        try:
-            with gzip.GzipFile(fileobj=io.BytesIO(gz_data)) as f:
-                xml_content = f.read()
+        # 4. Process EPGs sequentially (but from memory) to write to file
+        # We do this sequentially to avoid file write contention
+        for epg_data in downloaded_epgs:
+            if not unmatched_keys:
+                print("All channels matched. Skipping remaining files.")
+                break
                 
-            tree = ET.fromstring(xml_content)
+            found = process_single_epg(epg_data, unmatched_keys, m3u_map, outfile)
             
-            # Build EPG Indices for this file
-            # epg_id_map: id -> element
-            # epg_norm_name_map: normalized_name -> id
-            epg_id_map = {}
-            epg_norm_name_map = {}
-            
-            # Pre-scan EPG channels to build lookup tables
-            for channel in tree.findall("channel"):
-                c_id = channel.get("id")
-                epg_id_map[c_id] = channel
-                
-                display_name = channel.find("display-name")
-                if display_name is not None and display_name.text:
-                    norm_epg_name = normalize_name(display_name.text)
-                    # Store mapping. Note: Last channel with same name wins if duplicates exist in same EPG
-                    epg_norm_name_map[norm_epg_name] = c_id
-
-            # Mapping for this specific EPG file: source_id -> list_of_target_m3u_ids
-            source_to_dest_map = {}
-            
-            # List of keys to remove from unmatched after this pass
-            found_keys = []
-
-            # MATCHING LOGIC
-            for m3u_key in list(unmatched_keys): # Iterate copy so we can modify set
-                match_found = False
-                source_epg_id = None
-                
-                # A. MANUAL OVERRIDE CHECK
-                if m3u_key in MANUAL_OVERRIDES:
-                    override_id = MANUAL_OVERRIDES[m3u_key]
-                    if override_id in epg_id_map:
-                        source_epg_id = override_id
-                        match_found = True
-                        # print(f"  [Override] Matched {m3u_key} -> {source_epg_id}")
-
-                # B. EXACT NAME MATCH
-                if not match_found:
-                    if m3u_key in epg_norm_name_map:
-                        source_epg_id = epg_norm_name_map[m3u_key]
-                        match_found = True
-                        # print(f"  [Exact] Matched {m3u_key} -> {source_epg_id}")
-
-                # C. FUZZY MATCH
-                if not match_found:
-                    # Get close matches from EPG keys
-                    matches = difflib.get_close_matches(m3u_key, epg_norm_name_map.keys(), n=1, cutoff=FUZZY_MATCH_CUTOFF)
-                    if matches:
-                        best_match = matches[0]
-                        source_epg_id = epg_norm_name_map[best_match]
-                        match_found = True
-                        # print(f"  [Fuzzy] Matched {m3u_key} (~ {best_match}) -> {source_epg_id}")
-
-                # D. PROCESS MATCH
-                if match_found and source_epg_id:
-                    target_ids = m3u_map[m3u_key]['ids']
-                    source_to_dest_map[source_epg_id] = target_ids
-                    
-                    # Add Channel Elements to Output
-                    source_channel_elem = epg_id_map[source_epg_id]
-                    for tid in target_ids:
-                        new_channel = copy.deepcopy(source_channel_elem)
-                        new_channel.set("id", tid)
-                        output_root.append(new_channel)
-                        processed_channels_count += 1
-                    
-                    found_keys.append(m3u_key)
-
-            # Remove matched keys from the waitlist
-            for k in found_keys:
+            # Update unmatched list
+            for k in found:
                 unmatched_keys.discard(k)
 
-            print(f"  Matched {len(found_keys)} channels in this file.")
+        # Close XML Root
+        outfile.write('</tv>')
 
-            # Copy Programmes
-            # Only copy programmes if the channel was matched in this file
-            prog_count = 0
-            for programme in tree.findall("programme"):
-                src_channel = programme.get("channel")
-                if src_channel in source_to_dest_map:
-                    target_ids = source_to_dest_map[src_channel]
-                    for tid in target_ids:
-                        new_prog = copy.deepcopy(programme)
-                        new_prog.set("channel", tid)
-                        output_root.append(new_prog)
-                        prog_count += 1
-            
-            print(f"  Copied {prog_count} programme entries.")
-
-        except Exception as e:
-            print(f"Failed to process XML from {url}: {e}")
-
-    # 4. Write Final XML
-    print(f"\nWriting {OUTPUT_FILENAME}...")
-    tree = ET.ElementTree(output_root)
-    tree.write(OUTPUT_FILENAME, encoding="UTF-8", xml_declaration=True)
-
-    # 5. Generate Missing Report
-    print(f"Generating {MISSING_REPORT_FILENAME}...")
+    # 5. Report
+    print(f"\nGenerating {MISSING_REPORT_FILENAME}...")
     with open(MISSING_REPORT_FILENAME, "w", encoding="utf-8") as f:
-        f.write("--- MISSING CHANNELS REPORT ---\n")
-        f.write(f"Total M3U Groups: {total_m3u_channels}\n")
-        f.write(f"Matched Groups: {total_m3u_channels - len(unmatched_keys)}\n")
-        f.write(f"Missing Groups: {len(unmatched_keys)}\n")
-        f.write("-------------------------------\n\n")
-        
-        if len(unmatched_keys) == 0:
-            f.write("CONGRATULATIONS! 100% MATCHED.\n")
+        f.write(f"Total Groups: {total_groups}\nMatched: {total_groups - len(unmatched_keys)}\nMissing: {len(unmatched_keys)}\n\n")
+        if unmatched_keys:
+            f.write("MISSING CHANNELS:\n")
+            for k in sorted(list(unmatched_keys)):
+                f.write(f"{k} : {m3u_map[k]['original_names'][0]}\n")
         else:
-            f.write("The following M3U channels (Original Names) could not be matched to any EPG:\n\n")
-            # Sort for readability
-            sorted_missing = sorted(list(unmatched_keys))
-            for k in sorted_missing:
-                original_names = m3u_map[k]['original_names']
-                f.write(f"Key (Smashed): {k}\n")
-                for name in original_names:
-                    f.write(f" - {name}\n")
-                f.write("\n")
+            f.write("PERFECT MATCH!\n")
 
     print("Done.")
 
