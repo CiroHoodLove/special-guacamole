@@ -2,27 +2,35 @@ name: Update EPG
 
 on:
   schedule:
-    - cron: '0 4 * * *' # Runs every day at 4am
-  workflow_dispatch: # Allows manual click
+    - cron: '0 4 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  run-script:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+      
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
+          
       - name: Run Script
         run: python update_epg.py
-      - name: Save Result
+        
+      - name: Commit and Push
         run: |
-          git config --global user.name "AutoBot"
+          git config --global user.name "EPG-Bot"
           git config --global user.email "bot@noreply.github.com"
           git add custom_epg.xml
-          git commit -m "Update EPG" || echo "No changes"
-          git push
+          # The part below checks if there are changes before trying to commit
+          if [[ -n $(git status -s) ]]; then
+            git commit -m "Auto-update EPG"
+            git push
+          else
+            echo "No changes to commit."
+          fi
