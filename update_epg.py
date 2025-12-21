@@ -2,31 +2,41 @@ import urllib.request
 import json
 import re
 import xml.etree.ElementTree as ET
+import sys
 from difflib import get_close_matches
 
 # === CONFIGURATION ===
-# Your IPTV Playlist
 M3U_URL = "https://gist.githubusercontent.com/CiroHoodLove/ba36db853c30c47a3480020e87a352e6/raw/5e6e350293ec1c9ac7fa25fe1c0c6e5b3c3fabab/playlist.m3u"
-
-# The Database & Source
 API_CHANNELS_URL = "https://iptv-org.github.io/api/channels.json"
-EPG_XML_URL = "https://iptv-org.github.io/epg/xml/fr.xml" # France Only
+EPG_XML_URL = "https://iptv-org.github.io/epg/xml/fr.xml"
 OUTPUT_FILENAME = "custom_epg.xml"
-# =====================
+
+# Headers to make us look like a real browser (Fixes 403 Forbidden)
+HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+
+def fetch_url(url, description):
+    print(f"Downloading {description} from: {url}")
+    try:
+        req = urllib.request.Request(url, headers=HEADERS)
+        with urllib.request.urlopen(req) as response:
+            return response.read()
+    except Exception as e:
+        print(f"!!! CRITICAL ERROR downloading {description}: {e}")
+        # We exit with error code 1 to force the GitHub Action to show RED immediately
+        sys.exit(1) 
 
 def normalize(text):
     if not text: return ""
     text = text.lower()
-    for word in ['fr', 'fr:', 'fr-', 'fhd', 'hd', 'hevc', 'vip', '4k', 'backup', 'low', 'mobile', '|', '★', '(', ')']:
+    for word in ['fr', 'fr:', 'fr-', 'fhd', 'hd', 'hevc', 'vip', '4k', 'backup', '|', '(', ')']:
         text = text.replace(word, '')
     return re.sub(r'[^a-z0-9]', '', text)
 
 def main():
-    print("1. Fetching Database...")
-    with urllib.request.urlopen(API_CHANNELS_URL) as url:
-        data = json.loads(url.read().decode())
+    # 1. Fetch API
+    data_bytes = fetch_url(API_CHANNELS_URL, "Channel Database")
+    data = json.loads(data_bytes.decode())
     
-    # Build Dictionary: { "tf1": "TF1.fr", "tf1fhd": "TF1.fr" }
     api_lookup = {}
     for item in data:
         if item.get('country') == 'FR': 
@@ -35,51 +45,56 @@ def main():
             for alt in item.get('alt_names', []):
                 api_lookup[normalize(alt)] = cid
 
-    print("2. Fetching Your Playlist...")
-    my_channels = {} # { CleanName: Your_ID }
-    with urllib.request.urlopen(M3U_URL) as response:
-        for line in response.read().decode('utf-8', errors='ignore').splitlines():
-            if line.startswith('#EXTINF'):
-                tvg_match = re.search(r'tvg-id="([^"]+)"', line)
-                name_part = line.strip().split(',')[-1]
-                if tvg_match and name_part:
-                    my_channels[normalize(name_part)] = tvg_match.group(1)
+    # 2. Fetch M3U
+    m3u_bytes = fetch_url(M3U_URL, "Your Playlist")
+    my_channels = {}
+    for line in m3u_bytes.decode('utf-8', errors='ignore').splitlines():
+        if line.startswith('#EXTINF'):
+            tvg_match = re.search(r'tvg-id="([^"]+)"', line)
+            name_part = line.strip().split(',')[-1]
+            if tvg_match and name_part:
+                my_channels[normalize(name_part)] = tvg_match.group(1)
 
-    print("3. Downloading EPG...")
-    with urllib.request.urlopen(EPG_XML_URL) as response:
-        tree = ET.parse(response)
-        root = tree.getroot()
+    print(f"Found {len(my_channels)} channels in your playlist.")
 
-    print("4. Matching...")
-    # Map XML_ID (TF1.fr) -> Your_ID (12345)
+    # 3. Fetch EPG XML
+    xml_bytes = fetch_url(EPG_XML_URL, "EPG XML")
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError as e:
+        print(f"!!! Error parsing XML: {e}")
+        sys.exit(1)
+
+    # 4. Process
+    print("Matching channels...")
+    matches = 0
     xml_to_m3u = {} 
-    
-    # Reverse lookup: Use the XML Name -> Clean it -> Find in MyChannels
+
     for channel in root.findall('channel'):
         xml_id = channel.get('id')
         display_name = channel.find('display-name').text
         clean_name = normalize(display_name)
         
-        # Try finding this name in your playlist
         your_id = my_channels.get(clean_name)
-        
-        # Fuzzy match fallback
         if not your_id:
-            matches = get_close_matches(clean_name, my_channels.keys(), n=1, cutoff=0.85)
-            if matches:
-                your_id = my_channels[matches[0]]
+            found = get_close_matches(clean_name, my_channels.keys(), n=1, cutoff=0.85)
+            if found:
+                your_id = my_channels[found[0]]
         
         if your_id:
             channel.set('id', your_id)
             xml_to_m3u[xml_id] = your_id
+            matches += 1
 
     # Update Programmes
     for prog in root.findall('programme'):
         if prog.get('channel') in xml_to_m3u:
             prog.set('channel', xml_to_m3u[prog.get('channel')])
 
+    # Save
+    tree = ET.ElementTree(root)
     tree.write(OUTPUT_FILENAME, encoding='UTF-8', xml_declaration=True)
-    print("Done.")
+    print(f"SUCCESS! Updated {matches} channels. File saved.")
 
 if __name__ == "__main__":
     main()
